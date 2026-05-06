@@ -158,6 +158,30 @@ def resolve_model(model_name):
     return spec["request_id"], spec["root_ai_type"]
 
 
+def get_request_access_token():
+    """从 OpenAI 常用认证头中提取请求级 GenAI token。"""
+    authorization = request.headers.get("Authorization", "")
+    if authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+        if token:
+            return token
+
+    for header_name in ("X-Access-Token", "api-key", "X-API-Key"):
+        token = request.headers.get(header_name)
+        if token:
+            return token.strip()
+
+    return None
+
+
+def build_genai_headers(access_token=None):
+    """构建上游请求头，请求级 token 优先于启动参数 token。"""
+    headers = GENAI_HEADERS.copy()
+    if access_token:
+        headers["X-Access-Token"] = access_token
+    return headers
+
+
 def infer_root_ai_type(model_name):
     """为未知模型推断上游路由类型。
 
@@ -483,7 +507,7 @@ def extract_delta_from_genai(response_data):
     return {"reasoning": None, "content": None}
 
 
-def stream_genai_events(messages, model, max_tokens):
+def stream_genai_events(messages, model, max_tokens, access_token=None):
     """调用 GenAI 流式接口并产出统一事件流。
 
     该函数是整个协议转换的底层入口，负责：
@@ -495,6 +519,7 @@ def stream_genai_events(messages, model, max_tokens):
         messages (list[dict]): 发送给上游的消息列表。
         model (str): 调用方指定的模型名。
         max_tokens (int | None): 最大输出 token 数。
+        access_token (str | None): 请求级 GenAI token，未提供时使用启动参数。
 
     Yields:
         dict: 统一事件对象，`type` 可能为 `delta`、`done`、`meta` 或 `error`。
@@ -517,7 +542,7 @@ def stream_genai_events(messages, model, max_tokens):
     try:
         response = requests.post(
             GENAI_URL,
-            headers=GENAI_HEADERS,
+            headers=build_genai_headers(access_token),
             json=genai_data,
             stream=True,
             timeout=60
@@ -594,13 +619,14 @@ def stream_genai_events(messages, model, max_tokens):
         }
 
 
-def stream_chat_completions_response(messages, model, max_tokens):
+def stream_chat_completions_response(messages, model, max_tokens, access_token=None):
     """将内部事件流转换为 Chat Completions SSE。
 
     Args:
         messages (list[dict]): OpenAI 风格消息列表。
         model (str): 调用方传入的模型名。
         max_tokens (int | None): 最大输出 token 数。
+        access_token (str | None): 请求级 GenAI token，未提供时使用启动参数。
 
     Yields:
         str: 符合 OpenAI Chat Completions SSE 格式的文本片段。
@@ -608,7 +634,7 @@ def stream_chat_completions_response(messages, model, max_tokens):
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
 
-    for event in stream_genai_events(messages, model, max_tokens):
+    for event in stream_genai_events(messages, model, max_tokens, access_token):
         if event["type"] == "error":
             yield f"data: {json.dumps({'error': event['error']})}\n\n"
             return
@@ -724,13 +750,14 @@ def stream_tool_calls_response(model, content, tool_calls):
     yield "data: [DONE]\n\n"
 
 
-def collect_genai_response(messages, model, max_tokens):
+def collect_genai_response(messages, model, max_tokens, access_token=None):
     """收集完整响应并聚合为非流式结果。
 
     Args:
         messages (list[dict]): OpenAI 风格消息列表。
         model (str): 调用方传入的模型名。
         max_tokens (int | None): 最大输出 token 数。
+        access_token (str | None): 请求级 GenAI token，未提供时使用启动参数。
 
     Returns:
         dict[str, str | None]: 聚合后的正文、思维链和上游模型名。
@@ -742,7 +769,7 @@ def collect_genai_response(messages, model, max_tokens):
     reasoning_parts = []
     upstream_model = None
 
-    for event in stream_genai_events(messages, model, max_tokens):
+    for event in stream_genai_events(messages, model, max_tokens, access_token):
         if event["type"] == "error":
             raise RuntimeError(event["error"])
         if event["type"] == "delta":
@@ -807,13 +834,14 @@ def build_response_input_messages(input_value):
     return []
 
 
-def stream_responses_api(messages, model, max_tokens):
+def stream_responses_api(messages, model, max_tokens, access_token=None):
     """将内部事件流转换为最小 Responses API SSE。
 
     Args:
         messages (list[dict]): 发送给上游的消息列表。
         model (str): 调用方传入的模型名。
         max_tokens (int | None): 最大输出 token 数。
+        access_token (str | None): 请求级 GenAI token，未提供时使用启动参数。
 
     Yields:
         str: 符合最小 Responses API SSE 格式的文本片段。
@@ -835,7 +863,7 @@ def stream_responses_api(messages, model, max_tokens):
     }
     yield f"data: {json.dumps(created_event)}\n\n"
 
-    for event in stream_genai_events(messages, model, max_tokens):
+    for event in stream_genai_events(messages, model, max_tokens, access_token):
         if event["type"] == "error":
             error_event = {
                 "type": "response.failed",
@@ -910,6 +938,7 @@ def chat_completions():
         max_tokens = req_data.get('max_tokens', req_data.get('max_completion_tokens', 30000))
         tools = get_request_tools(req_data)
         tool_choice = get_request_tool_choice(req_data)
+        access_token = get_request_access_token()
         
         # 转换消息格式
         chat_info = convert_messages_to_genai_format(messages)
@@ -924,7 +953,7 @@ def chat_completions():
 
         if stream:
             if tools_enabled:
-                collected = collect_genai_response(upstream_messages, model, max_tokens)
+                collected = collect_genai_response(upstream_messages, model, max_tokens, access_token)
                 tool_calls = parse_tool_calls_from_content(collected["content"])
                 return Response(
                     stream_with_context(stream_tool_calls_response(model, collected["content"], tool_calls)),
@@ -937,7 +966,7 @@ def chat_completions():
                 )
 
             return Response(
-                stream_with_context(stream_chat_completions_response(upstream_messages, model, max_tokens)),
+                stream_with_context(stream_chat_completions_response(upstream_messages, model, max_tokens, access_token)),
                 mimetype='text/event-stream',
                 headers={
                     'Cache-Control': 'no-cache',
@@ -947,7 +976,7 @@ def chat_completions():
             )
 
         # 非流式模式先完整收集，再一次性组装 OpenAI 响应体。
-        collected = collect_genai_response(upstream_messages, model, max_tokens)
+        collected = collect_genai_response(upstream_messages, model, max_tokens, access_token)
         tool_calls = parse_tool_calls_from_content(collected["content"]) if tools_enabled else []
         response = build_chat_completion_payload(
             model,
@@ -977,13 +1006,14 @@ def responses():
         stream = req_data.get('stream', False)
         max_output_tokens = req_data.get('max_output_tokens', req_data.get('max_tokens', 30000))
         messages = build_response_input_messages(req_data.get('input'))
+        access_token = get_request_access_token()
 
         if not messages:
             return jsonify({'error': 'No input message found'}), 400
 
         if stream:
             return Response(
-                stream_with_context(stream_responses_api(messages, model, max_output_tokens)),
+                stream_with_context(stream_responses_api(messages, model, max_output_tokens, access_token)),
                 mimetype='text/event-stream',
                 headers={
                     'Cache-Control': 'no-cache',
@@ -993,7 +1023,7 @@ def responses():
             )
 
         # 非流式返回时，将 reasoning 和 message 组装到 output 数组中。
-        collected = collect_genai_response(messages, model, max_output_tokens)
+        collected = collect_genai_response(messages, model, max_output_tokens, access_token)
         response_id = f"resp_{uuid.uuid4().hex}"
         output = []
         if collected["reasoning_content"]:
