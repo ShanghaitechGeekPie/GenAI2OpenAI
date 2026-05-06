@@ -4,6 +4,21 @@
 
 GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的聊天完成接口，利用上海科技大学的 GenAI API 进行智能对话。项目通过封装 GenAI API，支持思维链、流式响应和普通响应，从而方便客户端集成与调用。该项目适合开发具有中文支持及本地化需求的智能聊天机器人应用。
 
+**OpenAI Compatible 功能对比**
+
+| 能力项                                    | OpenAI 官方接口 | 本项目实现情况 | 说明                                                       |
+| ----------------------------------------- | --------------- | -------------- | ---------------------------------------------------------- |
+| `POST /v1/chat/completions`               | ✅ 原生支持     | ✅ 已兼容      | 入参/出参保持 OpenAI 风格，转发至 GenAI 上游               |
+| `POST /v1/responses`                      | ✅ 原生支持     | ✅ 最小兼容    | 支持基础 `input`、流式与非流式输出                         |
+| 流式输出（SSE）                           | ✅              | ✅             | 支持 Chat Completions 与 Responses 两条链路                |
+| 非流式输出                                | ✅              | ✅             | 统一聚合上游增量后返回标准 JSON                            |
+| 推理内容字段（reasoning）                 | 部分模型支持    | ✅ 兼容输出    | 通过 `reasoning_content` / `response.reasoning.delta` 暴露 |
+| Tool Calling（`tools/tool_choice`）       | ✅ 原生         | ✅ 提示词兼容  | 上游无原生工具调用，本项目做 JSON 约定与本地解析           |
+| 旧版函数调用（`functions/function_call`） | 已逐步废弃      | ✅ 兼容        | 自动转换为 `tools/tool_choice` 语义                        |
+| 图片输入（Vision）                        | ✅  | ✅（GPT 模型） | 服务端自动上传图片并注入 `imageUrl/width/height`           |
+| 模型列表接口（`GET /v1/models`）          | ✅              | ✅             | 返回本项目映射后的可用模型列表                             |
+| 认证头兼容（Bearer/API Key）              | ✅              | ✅             | 支持 `Authorization`、`X-Access-Token`、`api-key` 等       |
+
 ## 安装与运行
 
 ### 环境要求
@@ -178,7 +193,7 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 
 ![图片说明](images/chrome.png)
 
-对于图片功能, 需要捕获`upload` API, 提取请求header中的 `token` ,然后通过 `--upload-token` 传入.
+对于图片功能, 需要捕获`upload` API, 提取请求 header 中的 `token` ,然后通过 `--upload-token` 传入.
 
 ## 开发与贡献指南
 
