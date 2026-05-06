@@ -5,6 +5,8 @@ import json
 import logging
 import mimetypes
 import os
+import re
+import sys
 import uuid
 from datetime import datetime
 from urllib.parse import urlparse
@@ -15,13 +17,18 @@ from flask_cors import CORS
 from rich.console import Console
 from rich.logging import RichHandler
 
+sys.path.append(os.path.join(os.path.dirname(__file__), "utility", "auto_login"))
+from cas_login import LoginError, login_genai
+
 app = Flask(__name__)
 CORS(app)
 
 # 解析命令行参数
 parser = argparse.ArgumentParser(description='GenAI Flask API Server')
-parser.add_argument('--token', type=str, default='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3NjMzNjA2MzgsInVzZXJuYW1lIjoiMjAyNDEzNDAyMiJ9.b4E5VzUxkn0Kc1pxkKVipybRFCw47NcppBognTD39e8',
+parser.add_argument('--token', type=str, default=None,
                     help='GenAI API Access Token')
+parser.add_argument('--account', type=str, default=None,
+                    help='ShanghaiTech account in the format student_id@password, used to auto-login and get token')
 parser.add_argument('--upload-token', type=str, default='2ea38f293adb4abca21132feba61eaa3',
                     help='GenAI image upload API token header value')
 parser.add_argument('--port', type=int, default=5000,
@@ -39,6 +46,19 @@ logging.basicConfig(
     handlers=[RichHandler(console=console, rich_tracebacks=True)],
 )
 logger = logging.getLogger('genai-proxy')
+
+if not args.token and args.account:
+    try:
+        account_student_id, account_password = args.account.split("@", 1)
+        logger.info("Attempting auto login with account: %s", account_student_id)
+        args.token = login_genai(account_student_id, account_password)
+        logger.info("Auto login succeeded for account: %s", account_student_id)
+    except ValueError:
+        logger.error("Invalid --account format, expected student_id@password")
+        raise SystemExit("--account must be in the format student_id@password")
+    except LoginError as exc:
+        logger.exception("Auto login failed")
+        raise SystemExit(f"Auto login failed: {exc}")
 
 # 进程内图片去重缓存：image_sha256 -> {imageUrl, width, height}
 IMAGE_UPLOAD_CACHE = {}
@@ -58,7 +78,7 @@ GENAI_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "X-Access-Token": args.token,
+    "X-Access-Token": args.token or "",
     "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
@@ -528,8 +548,9 @@ def build_tool_calling_messages(messages, tools, tool_choice):
     normalized_choice = normalize_tool_choice(tool_choice)
     tool_prompt = [
         "你可以调用调用方提供的工具，但上游 API 没有原生 tool calling 能力。",
-        "当你决定调用工具时，必须只输出一个 JSON 对象，不要输出 Markdown、解释或额外文本。",
+        "当你决定调用工具时，优先输出一个 JSON 对象，不要输出 Markdown、解释或额外文本。",
         "JSON 格式必须为：{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{}}]}。",
+        "兼容格式：也允许输出 <tool_call>{\"name\":\"工具名\",\"arguments\":{}}</tool_call>；若并行调用可连续输出多个 <tool_call>...</tool_call>。",
         "arguments 必须是符合工具 JSON Schema 的对象。",
         "如果不需要调用工具，则正常回答用户，不要输出上述 JSON。",
         f"tool_choice: {json.dumps(normalized_choice, ensure_ascii=False)}",
@@ -609,19 +630,54 @@ def normalize_tool_call_arguments(arguments):
     return json.dumps(arguments, ensure_ascii=False)
 
 
+def extract_tool_calls_from_xml(content):
+    """从 <tool_call>...</tool_call> 中提取工具调用（XML 兼容，JSON 仍为主）。"""
+    if not content:
+        return []
+
+    blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.DOTALL)
+    tool_calls = []
+    for block in blocks:
+        parsed = extract_json_object(block)
+        if not isinstance(parsed, dict):
+            continue
+
+        name = parsed.get("name")
+        if not name:
+            continue
+
+        arguments = parsed.get("arguments", {})
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": normalize_tool_call_arguments(arguments),
+            },
+        })
+
+    return tool_calls
+
+
 def parse_tool_calls_from_content(content):
     """解析提示词约定的工具调用 JSON，并转换为 OpenAI tool_calls 结构。"""
     if not content:
         return []
 
+    # 优先 JSON：兼容当前主路径。
     parsed = extract_json_object(content)
-    if not isinstance(parsed, dict):
-        return []
+    raw_calls = None
+    if isinstance(parsed, dict):
+        raw_calls = parsed.get("tool_calls")
+        if raw_calls is None and parsed.get("name"):
+            raw_calls = [parsed]
+    elif "<tool_call>" in content:
+        # JSON 解析失败时回退 XML。
+        return extract_tool_calls_from_xml(content)
 
-    raw_calls = parsed.get("tool_calls")
-    if raw_calls is None and parsed.get("name"):
-        raw_calls = [parsed]
     if not isinstance(raw_calls, list):
+        if "<tool_call>" in content:
+            return extract_tool_calls_from_xml(content)
         return []
 
     tool_calls = []
