@@ -202,6 +202,265 @@ def convert_messages_to_genai_format(messages):
     
     return chat_info
 
+
+def normalize_content_for_genai(content):
+    """将 OpenAI 消息 content 归一化为上游可读文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if text:
+                    text_parts.append(text)
+            elif isinstance(part, str):
+                text_parts.append(part)
+        return "\n".join(text_parts)
+    return str(content)
+
+
+def normalize_messages_for_genai(messages):
+    """把 OpenAI tool messages 降级为普通文本，避免上游无法理解原生工具结构。"""
+    normalized_messages = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role", "user")
+        content = normalize_content_for_genai(message.get("content"))
+
+        if role == "tool":
+            tool_name = message.get("name") or message.get("tool_call_id") or "tool"
+            normalized_messages.append({
+                "role": "user",
+                "content": f"工具 {tool_name} 返回结果：\n{content}",
+            })
+            continue
+
+        tool_calls = message.get("tool_calls")
+        if role == "assistant" and tool_calls and not content:
+            normalized_messages.append({
+                "role": "assistant",
+                "content": "已请求调用工具：\n" + json.dumps(tool_calls, ensure_ascii=False),
+            })
+            continue
+
+        normalized_messages.append({
+            "role": role,
+            "content": content,
+        })
+
+    return normalized_messages
+
+
+def should_enable_tools(tools, tool_choice):
+    """判断当前请求是否需要启用本地工具调用兼容层。"""
+    return bool(tools) and tool_choice != "none"
+
+
+def get_request_tools(req_data):
+    """读取新版 tools 或旧版 functions 入参，统一为 OpenAI tools 结构。"""
+    tools = req_data.get("tools")
+    if tools:
+        return tools
+
+    functions = req_data.get("functions")
+    if not functions:
+        return []
+
+    return [
+        {
+            "type": "function",
+            "function": function,
+        }
+        for function in functions
+        if isinstance(function, dict)
+    ]
+
+
+def get_request_tool_choice(req_data):
+    """读取新版 tool_choice 或旧版 function_call 入参。"""
+    if "tool_choice" in req_data:
+        return req_data.get("tool_choice")
+
+    function_call = req_data.get("function_call")
+    if isinstance(function_call, dict) and function_call.get("name"):
+        return {"name": function_call["name"]}
+    return function_call
+
+
+def normalize_tool_choice(tool_choice):
+    """将 OpenAI 的 tool_choice 归一化为提示词中便于描述的约束。"""
+    if tool_choice is None:
+        return "auto"
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("name"):
+            return {"name": tool_choice["name"]}
+        function_name = tool_choice.get("function", {}).get("name")
+        if function_name:
+            return {"name": function_name}
+    return "auto"
+
+
+def build_tool_calling_messages(messages, tools, tool_choice):
+    """通过提示词工程让无原生工具调用能力的上游返回可解析的工具调用 JSON。"""
+    normalized_choice = normalize_tool_choice(tool_choice)
+    tool_prompt = [
+        "你可以调用调用方提供的工具，但上游 API 没有原生 tool calling 能力。",
+        "当你决定调用工具时，必须只输出一个 JSON 对象，不要输出 Markdown、解释或额外文本。",
+        "JSON 格式必须为：{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{}}]}。",
+        "arguments 必须是符合工具 JSON Schema 的对象。",
+        "如果不需要调用工具，则正常回答用户，不要输出上述 JSON。",
+        f"tool_choice: {json.dumps(normalized_choice, ensure_ascii=False)}",
+        "可用工具：",
+        json.dumps(tools, ensure_ascii=False),
+    ]
+
+    if normalized_choice == "required":
+        tool_prompt.append("本次请求必须调用至少一个工具。")
+    elif isinstance(normalized_choice, dict):
+        tool_prompt.append(f"本次请求必须调用工具 {normalized_choice['name']}。")
+
+    return [
+        {"role": "system", "content": "\n".join(tool_prompt)},
+        *messages,
+    ]
+
+
+def strip_json_code_fence(text):
+    """去掉模型偶尔包裹的 JSON Markdown 代码块。"""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def extract_json_object(text):
+    """从文本中提取第一个完整 JSON 对象。"""
+    stripped = strip_json_code_fence(text)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    start = stripped.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(stripped)):
+        char = stripped[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(stripped[start:index + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def normalize_tool_call_arguments(arguments):
+    """OpenAI 要求 function.arguments 是 JSON 字符串。"""
+    if isinstance(arguments, str):
+        return arguments
+    if arguments is None:
+        return "{}"
+    return json.dumps(arguments, ensure_ascii=False)
+
+
+def parse_tool_calls_from_content(content):
+    """解析提示词约定的工具调用 JSON，并转换为 OpenAI tool_calls 结构。"""
+    if not content:
+        return []
+
+    parsed = extract_json_object(content)
+    if not isinstance(parsed, dict):
+        return []
+
+    raw_calls = parsed.get("tool_calls")
+    if raw_calls is None and parsed.get("name"):
+        raw_calls = [parsed]
+    if not isinstance(raw_calls, list):
+        return []
+
+    tool_calls = []
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, dict):
+            continue
+
+        function = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else raw_call
+        name = function.get("name")
+        if not name:
+            continue
+
+        arguments = function.get("arguments", {})
+        tool_calls.append({
+            "id": raw_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": normalize_tool_call_arguments(arguments),
+            },
+        })
+
+    return tool_calls
+
+
+def build_chat_completion_payload(model, content, reasoning_content=None, tool_calls=None):
+    """构建非流式 Chat Completions 响应。"""
+    message = {
+        "role": "assistant",
+        "content": None if tool_calls else content,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    elif reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(datetime.now().timestamp()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": len(content or ""),
+            "total_tokens": len(content or "")
+        }
+    }
+
 def extract_delta_from_genai(response_data):
     """从 GenAI 增量响应中提取正文和思维链字段。
 
@@ -397,6 +656,74 @@ def stream_chat_completions_response(messages, model, max_tokens):
             return
 
 
+def stream_tool_calls_response(model, content, tool_calls):
+    """将完整解析出的工具调用转换为 Chat Completions SSE。"""
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(datetime.now().timestamp())
+
+    if tool_calls:
+        delta_tool_calls = []
+        for index, tool_call in enumerate(tool_calls):
+            delta_tool_calls.append({
+                "index": index,
+                "id": tool_call["id"],
+                "type": "function",
+                "function": tool_call["function"],
+            })
+
+        tool_call_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": delta_tool_calls,
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+        yield f"data: {json.dumps(tool_call_chunk)}\n\n"
+        finish_reason = "tool_calls"
+    else:
+        content_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": content,
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+        yield f"data: {json.dumps(content_chunk)}\n\n"
+        finish_reason = "stop"
+
+    final_response = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }
+        ]
+    }
+    yield f"data: {json.dumps(final_response)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 def collect_genai_response(messages, model, max_tokens):
     """收集完整响应并聚合为非流式结果。
 
@@ -580,7 +907,9 @@ def chat_completions():
         messages = req_data.get('messages', [])
         model = req_data.get('model', 'gpt-3.5-turbo')
         stream = req_data.get('stream', False)
-        max_tokens = req_data.get('max_tokens', 30000)
+        max_tokens = req_data.get('max_tokens', req_data.get('max_completion_tokens', 30000))
+        tools = get_request_tools(req_data)
+        tool_choice = get_request_tool_choice(req_data)
         
         # 转换消息格式
         chat_info = convert_messages_to_genai_format(messages)
@@ -588,9 +917,27 @@ def chat_completions():
         if not chat_info:
             return jsonify({'error': 'No user message found'}), 400
 
+        tools_enabled = should_enable_tools(tools, tool_choice)
+        upstream_messages = normalize_messages_for_genai(messages)
+        if tools_enabled:
+            upstream_messages = build_tool_calling_messages(upstream_messages, tools, tool_choice)
+
         if stream:
+            if tools_enabled:
+                collected = collect_genai_response(upstream_messages, model, max_tokens)
+                tool_calls = parse_tool_calls_from_content(collected["content"])
+                return Response(
+                    stream_with_context(stream_tool_calls_response(model, collected["content"], tool_calls)),
+                    mimetype='text/event-stream',
+                    headers={
+                        'Cache-Control': 'no-cache',
+                        'Connection': 'keep-alive',
+                        'Content-Type': 'text/event-stream',
+                    }
+                )
+
             return Response(
-                stream_with_context(stream_chat_completions_response(messages, model, max_tokens)),
+                stream_with_context(stream_chat_completions_response(upstream_messages, model, max_tokens)),
                 mimetype='text/event-stream',
                 headers={
                     'Cache-Control': 'no-cache',
@@ -600,29 +947,14 @@ def chat_completions():
             )
 
         # 非流式模式先完整收集，再一次性组装 OpenAI 响应体。
-        collected = collect_genai_response(messages, model, max_tokens)
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion",
-            "created": int(datetime.now().timestamp()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": collected["content"],
-                        "reasoning_content": collected["reasoning_content"],
-                    },
-                    "finish_reason": "stop"
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": len(collected["content"]),
-                "total_tokens": len(collected["content"])
-            }
-        }
+        collected = collect_genai_response(upstream_messages, model, max_tokens)
+        tool_calls = parse_tool_calls_from_content(collected["content"]) if tools_enabled else []
+        response = build_chat_completion_payload(
+            model,
+            collected["content"],
+            collected["reasoning_content"],
+            tool_calls,
+        )
         return jsonify(response)
     
     except Exception as e:

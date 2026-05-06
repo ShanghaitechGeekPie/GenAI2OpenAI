@@ -23,6 +23,7 @@ uv run main.py --token <token> [--port 5000]
 
 - 兼容 OpenAI API，支持 `POST /v1/chat/completions`、`POST /v1/responses`接口，实现智能聊天功能。
 - 支持流式（stream）及非流式响应，方便高效地获取 AI 回复。
+- `POST /v1/chat/completions` 支持基于提示词工程和 JSON 解析的 OpenAI `tools`/`tool_choice` 兼容工具调用，也兼容旧版 `functions`/`function_call` 入参。
 - 提供 `/v1/models` 接口列出可用模型，如 `deepseek-v4-pro`、`gpt-5.5`、`glm-5.1` 等。
 - 内置 `/health` 健康检查接口，用于服务状态监测。
 
@@ -65,6 +66,38 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 
 **注意**：Azure GPT 模型有严格的额度限制，无法进行上下文长度测试。建议参考各模型的官方文档了解其标称上下文长度。
 
+### 工具调用兼容
+
+上游 GenAI API 没有原生 tool calling 能力。本项目在 Chat Completions 接口中通过系统提示词要求模型输出工具调用 JSON，并在本地解析为 OpenAI 兼容的 `tool_calls`：
+
+```json
+{
+  "model": "gpt-5.5",
+  "messages": [
+    {"role": "user", "content": "上海今天适合带伞吗？"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询城市天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"}
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
+```
+
+如果模型决定调用工具，非流式响应会返回 `finish_reason: "tool_calls"` 和 `message.tool_calls`。流式请求也会返回兼容的 `tool_calls` chunk，但为了可靠解析 JSON，带工具的流式请求会先在服务端收集完整上游输出后再发送结果。
+
 ## Token获取
 
 1. 首先前往[GenAI对话平台](https://genai.shanghaitech.edu.cn/dialogue)
@@ -88,5 +121,3 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 ## TODO
 
 - 身份验证或者签名机制，避免滥用
-- 基于提示词工程+json parser实现 tool-call 支持。
-
