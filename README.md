@@ -1,4 +1,4 @@
-# GenAI 项目
+# GenAI2OpenAI
 
 ## 项目简介
 
