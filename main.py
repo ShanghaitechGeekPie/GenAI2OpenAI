@@ -1,11 +1,19 @@
 import argparse
+import base64
+import hashlib
 import json
+import logging
+import mimetypes
+import os
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
+from rich.console import Console
+from rich.logging import RichHandler
 
 app = Flask(__name__)
 CORS(app)
@@ -14,12 +22,31 @@ CORS(app)
 parser = argparse.ArgumentParser(description='GenAI Flask API Server')
 parser.add_argument('--token', type=str, default='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3NjMzNjA2MzgsInVzZXJuYW1lIjoiMjAyNDEzNDAyMiJ9.b4E5VzUxkn0Kc1pxkKVipybRFCw47NcppBognTD39e8',
                     help='GenAI API Access Token')
+parser.add_argument('--upload-token', type=str, default='2ea38f293adb4abca21132feba61eaa3',
+                    help='GenAI image upload API token header value')
 parser.add_argument('--port', type=int, default=5000,
                     help='Flask server port (default: 5000)')
+parser.add_argument('--log-level', type=str, default='INFO',
+                    choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                    help='Console log level (default: INFO)')
 args = parser.parse_args()
+
+console = Console()
+logging.basicConfig(
+    level=getattr(logging, args.log_level.upper(), logging.INFO),
+    format='%(message)s',
+    datefmt='[%X]',
+    handlers=[RichHandler(console=console, rich_tracebacks=True)],
+)
+logger = logging.getLogger('genai-proxy')
+
+# 进程内图片去重缓存：image_sha256 -> {imageUrl, width, height}
+IMAGE_UPLOAD_CACHE = {}
 
 # GenAI API 配置
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
+GENAI_UPLOAD_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/upload"
+GENAI_IMAGE_STATIC_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/static/"
 GENAI_HEADERS = {
     "Accept": "*/*, text/event-stream",
     "Cache-Control": "no-cache",
@@ -179,6 +206,22 @@ def build_genai_headers(access_token=None):
     headers = GENAI_HEADERS.copy()
     if access_token:
         headers["X-Access-Token"] = access_token
+    logger.debug("Using upstream access token override: %s", bool(access_token))
+    return headers
+
+
+def build_genai_upload_headers(access_token=None):
+    """构建图片上传请求头。"""
+    headers = {
+        "Accept": "*/*",
+        "Origin": "https://genai.shanghaitech.edu.cn",
+        "Referer": "https://genai.shanghaitech.edu.cn/",
+        "User-Agent": GENAI_HEADERS["User-Agent"],
+        # 上传接口要求独立 token 头；同时附带 X-Access-Token 保持兼容。
+        "token": args.upload_token,
+        "X-Access-Token": access_token or args.token,
+    }
+    logger.debug("Upload headers prepared (token set=%s, request token override=%s)", bool(args.upload_token), bool(access_token))
     return headers
 
 
@@ -203,6 +246,143 @@ def infer_root_ai_type(model_name):
         "o4-mini",
     )
     return "azure" if normalized.startswith(azure_markers) else "xinference"
+
+
+def is_gpt_model(model_name):
+    """判断模型是否为 GPT/Azure 系列（图片能力仅对其开放）。"""
+    _, root_ai_type = resolve_model(model_name)
+    return root_ai_type == "azure"
+
+
+def guess_filename_from_url(image_url):
+    """从 URL 推断文件名。"""
+    path = urlparse(image_url).path
+    filename = os.path.basename(path) or "image"
+    if "." not in filename:
+        filename += ".jpg"
+    return filename
+
+
+def read_image_from_data_url(data_url):
+    """解析 data URL，返回 (bytes, mime_type, filename)。"""
+    header, encoded = data_url.split(",", 1)
+    mime_type = "image/jpeg"
+    if header.startswith("data:"):
+        mime_type = header[5:].split(";")[0] or mime_type
+    extension = mimetypes.guess_extension(mime_type) or ".jpg"
+    image_bytes = base64.b64decode(encoded)
+    return image_bytes, mime_type, f"image{extension}"
+
+
+def fetch_image_bytes(image_url):
+    """下载远端图片，返回 (bytes, mime_type, filename)。"""
+    response = requests.get(image_url, timeout=60)
+    response.raise_for_status()
+    mime_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0].strip() or "image/jpeg"
+    filename = guess_filename_from_url(image_url)
+    return response.content, mime_type, filename
+
+
+def upload_image_to_genai(image_bytes, filename, mime_type, access_token=None):
+    """上传图片到 GenAI 图片服务，返回上游需要的 URL 与尺寸信息。"""
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+    cached_payload = IMAGE_UPLOAD_CACHE.get(image_hash)
+    if cached_payload:
+        logger.debug("Image cache hit: sha256=%s url=%s", image_hash, cached_payload.get("imageUrl"))
+        return cached_payload
+
+    logger.debug("Image cache miss: sha256=%s", image_hash)
+    files = {
+        "file": (filename, image_bytes, mime_type),
+    }
+    data = {
+        "biz": "temp",
+        "uploadType": "local",
+    }
+    logger.debug("Uploading image to GenAI: filename=%s mime=%s bytes=%s", filename, mime_type, len(image_bytes))
+    response = requests.post(
+        GENAI_UPLOAD_URL,
+        headers=build_genai_upload_headers(access_token),
+        files=files,
+        data=data,
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    logger.debug("Upload response: %s", payload)
+    if not payload.get("success") or not isinstance(payload.get("result"), dict):
+        raise RuntimeError(f"Image upload failed: {payload}")
+
+    result = payload["result"]
+    relative_url = result.get("url")
+    if not relative_url:
+        raise RuntimeError("Image upload failed: missing result.url")
+    image_url = relative_url
+    if not image_url.startswith("http://") and not image_url.startswith("https://"):
+        image_url = f"{GENAI_IMAGE_STATIC_URL}{relative_url}"
+
+    payload = {
+        "imageUrl": image_url,
+        "width": result.get("width"),
+        "height": result.get("height"),
+    }
+    IMAGE_UPLOAD_CACHE[image_hash] = payload
+    logger.debug("Image cached: sha256=%s url=%s", image_hash, payload.get("imageUrl"))
+    return payload
+
+
+def parse_image_input_from_message(message):
+    """从单条 OpenAI user message 中提取图片输入（URL 或 data URL）。"""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type not in {"image_url", "input_image"}:
+            continue
+
+        if isinstance(part.get("image_url"), dict):
+            url_value = part["image_url"].get("url")
+            if url_value:
+                return url_value
+        if isinstance(part.get("image_url"), str):
+            return part.get("image_url")
+        if isinstance(part.get("url"), str):
+            return part.get("url")
+
+    return None
+
+
+def prepare_image_payload(messages, model, access_token=None):
+    """从请求消息中准备上游所需图片参数（仅 GPT 模型可用）。"""
+    image_input = None
+    for message in reversed(messages):
+        image_input = parse_image_input_from_message(message)
+        if image_input:
+            break
+
+    if not image_input:
+        logger.debug("No image input found in messages")
+        return None
+
+    if not is_gpt_model(model):
+        logger.debug("Rejecting image input for non-GPT model: %s", model)
+        raise ValueError("Image input is only available for GPT models")
+
+    if image_input.startswith("data:"):
+        image_bytes, mime_type, filename = read_image_from_data_url(image_input)
+    else:
+        image_bytes, mime_type, filename = fetch_image_bytes(image_input)
+
+    image_payload = upload_image_to_genai(image_bytes, filename, mime_type, access_token)
+    logger.debug("Prepared image payload: %s", image_payload)
+    return image_payload
 
 
 def convert_messages_to_genai_format(messages):
@@ -507,7 +687,7 @@ def extract_delta_from_genai(response_data):
     return {"reasoning": None, "content": None}
 
 
-def stream_genai_events(messages, model, max_tokens, access_token=None):
+def stream_genai_events(messages, model, max_tokens, access_token=None, image_payload=None):
     """调用 GenAI 流式接口并产出统一事件流。
 
     该函数是整个协议转换的底层入口，负责：
@@ -538,6 +718,18 @@ def stream_genai_events(messages, model, max_tokens, access_token=None):
         "rootAiType": root_ai_type,
         "maxToken": max_tokens or 30000
     }
+    if image_payload:
+        genai_data.update(image_payload)
+
+    logger.debug(
+        "Upstream request prepared: model=%s rootAiType=%s stream=%s maxToken=%s has_image=%s message_count=%s",
+        upstream_model,
+        root_ai_type,
+        genai_data.get("stream"),
+        genai_data.get("maxToken"),
+        bool(image_payload),
+        len(messages) if isinstance(messages, list) else 0,
+    )
 
     try:
         response = requests.post(
@@ -549,6 +741,7 @@ def stream_genai_events(messages, model, max_tokens, access_token=None):
         )
 
         if response.status_code != 200:
+            logger.error("GenAI upstream HTTP error: %s", response.status_code)
             yield {
                 "type": "error",
                 "error": f"GenAI API error: {response.status_code}",
@@ -570,6 +763,7 @@ def stream_genai_events(messages, model, max_tokens, access_token=None):
 
                     if line_str:
                         genai_json = json.loads(line_str)
+                        logger.debug("Upstream SSE chunk keys: %s", list(genai_json.keys()))
 
                         # 上游偶尔会返回补充元数据，先保留为内部 meta 事件。
                         if genai_json.get("other"):
@@ -612,6 +806,7 @@ def stream_genai_events(messages, model, max_tokens, access_token=None):
         }
 
     except Exception as e:
+        logger.exception("stream_genai_events failed")
         # 流式链路统一转成 error 事件，交由上层协议各自包装。
         yield {
             "type": "error",
@@ -619,7 +814,7 @@ def stream_genai_events(messages, model, max_tokens, access_token=None):
         }
 
 
-def stream_chat_completions_response(messages, model, max_tokens, access_token=None):
+def stream_chat_completions_response(messages, model, max_tokens, access_token=None, image_payload=None):
     """将内部事件流转换为 Chat Completions SSE。
 
     Args:
@@ -634,7 +829,7 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
 
-    for event in stream_genai_events(messages, model, max_tokens, access_token):
+    for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
         if event["type"] == "error":
             yield f"data: {json.dumps({'error': event['error']})}\n\n"
             return
@@ -750,7 +945,7 @@ def stream_tool_calls_response(model, content, tool_calls):
     yield "data: [DONE]\n\n"
 
 
-def collect_genai_response(messages, model, max_tokens, access_token=None):
+def collect_genai_response(messages, model, max_tokens, access_token=None, image_payload=None):
     """收集完整响应并聚合为非流式结果。
 
     Args:
@@ -769,7 +964,7 @@ def collect_genai_response(messages, model, max_tokens, access_token=None):
     reasoning_parts = []
     upstream_model = None
 
-    for event in stream_genai_events(messages, model, max_tokens, access_token):
+    for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
         if event["type"] == "error":
             raise RuntimeError(event["error"])
         if event["type"] == "delta":
@@ -927,6 +1122,7 @@ def chat_completions():
     """
     try:
         req_data = request.get_json()
+        logger.debug("/v1/chat/completions request received: stream=%s model=%s", (req_data or {}).get('stream'), (req_data or {}).get('model'))
         
         # Chat Completions 至少需要消息数组。
         if not req_data or 'messages' not in req_data:
@@ -939,6 +1135,7 @@ def chat_completions():
         tools = get_request_tools(req_data)
         tool_choice = get_request_tool_choice(req_data)
         access_token = get_request_access_token()
+        image_payload = prepare_image_payload(messages, model, access_token)
         
         # 转换消息格式
         chat_info = convert_messages_to_genai_format(messages)
@@ -953,7 +1150,7 @@ def chat_completions():
 
         if stream:
             if tools_enabled:
-                collected = collect_genai_response(upstream_messages, model, max_tokens, access_token)
+                collected = collect_genai_response(upstream_messages, model, max_tokens, access_token, image_payload)
                 tool_calls = parse_tool_calls_from_content(collected["content"])
                 return Response(
                     stream_with_context(stream_tool_calls_response(model, collected["content"], tool_calls)),
@@ -966,7 +1163,7 @@ def chat_completions():
                 )
 
             return Response(
-                stream_with_context(stream_chat_completions_response(upstream_messages, model, max_tokens, access_token)),
+                stream_with_context(stream_chat_completions_response(upstream_messages, model, max_tokens, access_token, image_payload)),
                 mimetype='text/event-stream',
                 headers={
                     'Cache-Control': 'no-cache',
@@ -976,7 +1173,7 @@ def chat_completions():
             )
 
         # 非流式模式先完整收集，再一次性组装 OpenAI 响应体。
-        collected = collect_genai_response(upstream_messages, model, max_tokens, access_token)
+        collected = collect_genai_response(upstream_messages, model, max_tokens, access_token, image_payload)
         tool_calls = parse_tool_calls_from_content(collected["content"]) if tools_enabled else []
         response = build_chat_completion_payload(
             model,
@@ -987,6 +1184,7 @@ def chat_completions():
         return jsonify(response)
     
     except Exception as e:
+        logger.exception("chat_completions failed")
         return jsonify({'error': str(e)}), 500
 
 
@@ -999,6 +1197,7 @@ def responses():
     """
     try:
         req_data = request.get_json()
+        logger.debug("/v1/responses request received: stream=%s model=%s", (req_data or {}).get('stream'), (req_data or {}).get('model'))
         if not req_data or 'input' not in req_data:
             return jsonify({'error': 'Missing input field'}), 400
 
@@ -1060,6 +1259,7 @@ def responses():
         })
 
     except Exception as e:
+        logger.exception("responses failed")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/v1/models', methods=['GET'])
