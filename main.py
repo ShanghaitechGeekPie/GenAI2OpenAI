@@ -65,6 +65,7 @@ IMAGE_UPLOAD_CACHE = {}
 
 # GenAI API 配置
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
+GENAI_MODELS_URL = "https://genai.shanghaitech.edu.cn/htk/ai/aiModel/list"
 GENAI_UPLOAD_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/upload"
 GENAI_IMAGE_STATIC_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/static/"
 GENAI_HEADERS = {
@@ -240,6 +241,75 @@ def build_genai_headers(access_token=None):
         headers["X-Access-Token"] = access_token
     logger.debug("Using upstream access token override: %s", bool(access_token))
     return headers
+
+
+def fetch_remote_models(access_token=None):
+    """拉取 GenAI 平台当前可用模型列表。"""
+    response = requests.get(
+        GENAI_MODELS_URL,
+        headers=build_genai_headers(access_token),
+        params={
+            "_t": int(datetime.now().timestamp() * 1000),
+            "pageNo": 1,
+            "pageSize": 999,
+            "showStatusList": "2,3",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("success"):
+        raise RuntimeError(f"Failed to fetch remote models: {payload}")
+    return payload.get("result", {}).get("records", [])
+
+
+def log_new_remote_models(access_token=None):
+    """启动时检查远端模型列表，提示本地未登记的新模型。"""
+    if not access_token:
+        logger.debug("Skipping remote model discovery because no startup token is available")
+        return
+
+    try:
+        remote_records = fetch_remote_models(access_token)
+    except Exception:
+        logger.exception("Failed to fetch remote model list at startup")
+        return
+
+    local_aliases = {
+        alias.lower()
+        for spec in MODEL_SPECS
+        for alias in (spec["public_id"], spec["request_id"], spec["actual_id"])
+        if isinstance(alias, str)
+    }
+
+    discovered = []
+    for record in remote_records:
+        ai_type = record.get("aiType")
+        simple_name = record.get("simpleName")
+        ai_name = record.get("aiName")
+        candidates = [value for value in (ai_type, simple_name, ai_name) if isinstance(value, str) and value]
+        if any(candidate.lower() in local_aliases for candidate in candidates):
+            continue
+        discovered.append({
+            "aiType": ai_type,
+            "simpleName": simple_name,
+            "aiName": ai_name,
+            "rootAiType": record.get("rootAiType"),
+        })
+
+    if not discovered:
+        logger.info("Remote model discovery: no new models compared with local MODEL_SPECS")
+        return
+
+    logger.warning("Remote model discovery found %d new model(s) not in local MODEL_SPECS:", len(discovered))
+    for model in discovered:
+        logger.warning(
+            "  - aiType=%s simpleName=%s aiName=%s rootAiType=%s",
+            model.get("aiType"),
+            model.get("simpleName"),
+            model.get("aiName"),
+            model.get("rootAiType"),
+        )
 
 
 def build_genai_upload_headers(access_token=None):
@@ -1358,4 +1428,5 @@ def health_check():
     return jsonify({"status": "ok"}), 200
 
 if __name__ == '__main__':
+    log_new_remote_models(args.token)
     app.run(host='0.0.0.0', port=args.port, debug=False)
