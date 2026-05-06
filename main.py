@@ -143,6 +143,18 @@ MODEL_SPECS = [
         "actual_id": "o3-2025-04-16",
         "root_ai_type": "azure",
     },
+    {
+        "public_id": "deepseek-pro",
+        "request_id": "deepseek-pro",
+        "actual_id": "deepseek-v4-pro",
+        "root_ai_type": "xinference",
+    },
+    {
+        "public_id": "deepseek-chat",
+        "request_id": "deepseek-chat",
+        "actual_id": "deepseek-v4-flash",
+        "root_ai_type": "xinference",
+    },
 ]
 
 
