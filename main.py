@@ -220,6 +220,10 @@ def resolve_model(model_name):
 
 def get_request_access_token():
     """从 OpenAI 常用认证头中提取请求级 GenAI token。"""
+    if args.account:
+        logger.debug("Ignoring request access token because --account is enabled")
+        return None
+
     authorization = request.headers.get("Authorization", "")
     if authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
