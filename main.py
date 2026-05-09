@@ -47,18 +47,133 @@ logging.basicConfig(
 )
 logger = logging.getLogger('genai-proxy')
 
-if not args.token and args.account:
+BASE_DIR = os.path.dirname(__file__)
+TOKEN_CACHE_PATH = os.path.join(BASE_DIR, ".genai_token_cache")
+
+
+def load_cached_token():
+    """从项目本目录读取缓存 token。"""
+    if not os.path.exists(TOKEN_CACHE_PATH):
+        return None
+
     try:
-        account_student_id, account_password = args.account.split("@", 1)
+        with open(TOKEN_CACHE_PATH, "r", encoding="utf-8") as token_file:
+            token = token_file.read().strip()
+    except OSError:
+        logger.exception("Failed to read token cache")
+        return None
+
+    return token or None
+
+
+def save_cached_token(token):
+    """将自动登录获得的 token 写入项目本目录缓存。"""
+    try:
+        with open(TOKEN_CACHE_PATH, "w", encoding="utf-8") as token_file:
+            token_file.write(token.strip())
+    except OSError:
+        logger.exception("Failed to write token cache")
+
+
+def build_startup_genai_headers(token):
+    """构建启动阶段校验 token 所需的最小上游请求头。"""
+    return {
+        "Accept": "*/*, text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "Origin": "https://genai.shanghaitech.edu.cn",
+        "Referer": "https://genai.shanghaitech.edu.cn/dialogue",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+        "X-Access-Token": token,
+    }
+
+
+def validate_cached_token(token):
+    """用 deepseek-v3 发起最小对话，返回非空内容则认为 token 有效。"""
+    if not token:
+        return False
+
+    payload = {
+        "chatInfo": "你好",
+        "messages": [{"role": "user", "content": "你好"}],
+        "type": "3",
+        "stream": True,
+        "aiType": "deepseek-v3:671b",
+        "aiSecType": "1",
+        "promptTokens": 0,
+        "rootAiType": "xinference",
+        "maxToken": 16,
+    }
+
+    try:
+        response = requests.post(
+            "https://genai.shanghaitech.edu.cn/htk/chat/start/chat",
+            headers=build_startup_genai_headers(token),
+            json=payload,
+            stream=True,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            logger.info("Cached token validation failed with HTTP %s", response.status_code)
+            return False
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+            if line_str.startswith("data:"):
+                line_str = line_str[5:].strip()
+            if not line_str:
+                continue
+
+            try:
+                chunk = json.loads(line_str)
+            except json.JSONDecodeError:
+                continue
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta") or {}
+            if delta.get("content") or delta.get("reasoning"):
+                return True
+    except Exception:
+        logger.exception("Cached token validation failed")
+
+    return False
+
+
+def auto_login_with_account(account):
+    try:
+        account_student_id, account_password = account.split("@", 1)
         logger.info("Attempting auto login with account: %s", account_student_id)
-        args.token = login_genai(account_student_id, account_password)
+        token = login_genai(account_student_id, account_password)
         logger.info("Auto login succeeded for account: %s", account_student_id)
+        save_cached_token(token)
+        return token
     except ValueError:
         logger.error("Invalid --account format, expected student_id@password")
         raise SystemExit("--account must be in the format student_id@password")
     except LoginError as exc:
         logger.exception("Auto login failed")
         raise SystemExit(f"Auto login failed: {exc}")
+
+
+if not args.token:
+    cached_token = load_cached_token()
+    if cached_token:
+        logger.info("Found cached token, validating with deepseek-v3")
+        if validate_cached_token(cached_token):
+            args.token = cached_token
+            logger.info("Cached token is valid")
+        else:
+            logger.info("Cached token is invalid or expired")
+
+if not args.token and args.account:
+    args.token = auto_login_with_account(args.account)
 
 # 进程内图片去重缓存：image_sha256 -> {imageUrl, width, height}
 IMAGE_UPLOAD_CACHE = {}

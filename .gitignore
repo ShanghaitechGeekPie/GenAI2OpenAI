@@ -204,6 +204,7 @@ cython_debug/
 # Local research artifacts
 /temp
 /AGENTS.md
+.genai_token_cache
 
 # Marimo
 marimo/_static/
