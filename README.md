@@ -9,6 +9,21 @@
 
 GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的聊天完成接口，利用上海科技大学的 GenAI API 进行智能对话。项目通过封装 GenAI API，支持思维链、流式响应和普通响应，从而方便客户端集成与调用。该项目适合开发具有中文支持及本地化需求的智能聊天机器人应用。
 
+## 项目结构
+
+```text
+main.py                         Flask 入口、路由和上游流式编排
+genai_proxy/models.py           模型列表、别名解析和上游路由类型
+genai_proxy/tools.py            消息归一化和提示词式 Tool Calling
+genai_proxy/images.py           图片 URL、Data URL 和消息图片解析
+genai_proxy/upstream.py         OpenAI 响应结构和输入转换
+utility/auto_login/             上海科技大学 CAS 自动登录
+tools/                          模型测速和上下文长度测试工具
+docs/                           模型记录和问题登记
+```
+
+`main.py` 保留 HTTP 路由和请求编排；可复用的模型、消息、图片和协议转换逻辑放在 `genai_proxy/` 中，便于单独检查和测试。
+
 **OpenAI Compatible 功能对比**
 
 | 能力项                                    | OpenAI 官方接口 | 本项目实现情况 | 说明                                                       |
@@ -21,7 +36,7 @@ GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的�
 | Tool Calling（`tools/tool_choice`）       | ✅ 原生         | ✅ 提示词兼容  | 上游无原生工具调用，本项目做 JSON 约定与本地解析           |
 | 旧版函数调用（`functions/function_call`） | 已逐步废弃      | ✅ 兼容        | 自动转换为 `tools/tool_choice` 语义                        |
 | 图片输入（Vision）                        | ✅              | ✅（GPT 模型） | 服务端自动上传图片并注入 `imageUrl/width/height`           |
-| 模型列表接口（`GET /v1/models`）          | ✅              | ✅             | 返回本项目映射后的可用模型列表                             |
+| 模型列表接口（`GET /v1/models`）          | ✅              | ✅             | 实时拉取上游列表，返回上游 `aiType` 作为模型 ID             |
 | 认证头兼容（Bearer/API Key）              | ✅              | ✅             | 支持 `Authorization`、`X-Access-Token`、`api-key` 等       |
 
 ### Agent Tool 生态测试
@@ -59,10 +74,14 @@ uv run main.py [--token <token>] [--account <student_id@password>] [--upload-tok
 - 支持流式（stream）及非流式响应，方便高效地获取 AI 回复。
 - `POST /v1/chat/completions` 支持基于提示词工程和 JSON 解析的 OpenAI `tools`/`tool_choice` 兼容工具调用，也兼容旧版 `functions`/`function_call` 入参。
 - `POST /v1/chat/completions` 支持图片输入（服务端自动上传到 GenAI 图片服务后再发起对话），当前**仅 GPT 系列模型可用**。
-- 提供 `/v1/models` 接口列出可用模型，如 `deepseek-pro`、`deepseek-chat`、`gpt-5.5`、`glm-5.1` 等。
+- `/v1/models` 每次请求都会拉取上游模型列表，客户端可据此选择模型；列表不会混入已下线的静态模型。
 - 内置 `/health` 健康检查接口，用于服务状态监测。
 
 ### 支持模型
+
+当前模型请以 `GET /v1/models` 为准。该接口沿用对话接口的认证方式：未启用 `--account` 时，请求级 token 优先，未提供则使用启动 token；`--account` 模式使用服务端 token。返回的 `id` 是上游 `aiType`，可直接填入对话请求的 `model`。上游拉取失败返回 HTTP 502，不回退到旧列表。列表包含上游发布的不同类型模型，不代表本项目已实现所有模型对应的功能。
+
+以下表格保留历史测速和上下文测试数据，不代表当前在线模型：
 
 | 模型 id           | 可用性 | 思维链 | 实测上下文长度     | first_token_delay | 输出速度       |
 | ----------------- | ------ | ------ | ------------------ | -------------- | -------------- |
@@ -83,7 +102,7 @@ uv run main.py [--token <token>] [--account <student_id@password>] [--upload-tok
 | deepseek-chat     | ✅     | 未知   | 未测试             | 0.983s         | 19.62 tokens/s | 
 
 兼容层同时兼容历史请求名和底层模型名，详见[模型列表](docs/模型列表.md)。
-以上信息最后更新于 `2026-05-08`。
+以上信息最后更新于 `2026-05-08`。上游模型和额度会变化，表中的速度与上下文数据只代表记录时的实测结果。
 
 ### 测试模型上下文长度
 
@@ -129,13 +148,19 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 }
 ```
 
-如果模型决定调用工具，非流式响应会返回 `finish_reason: "tool_calls"` 和 `message.tool_calls`。流式请求也会返回兼容的 `tool_calls` chunk，但为了可靠解析 JSON，带工具的流式请求会先在服务端收集完整上游输出后再发送结果。
+如果模型决定调用工具，非流式响应会返回 `finish_reason: "tool_calls"` 和 `message.tool_calls`。流式请求也会返回兼容的 `tool_calls` chunk，但为了可靠解析 JSON，带工具的流式请求会先在服务端收集完整上游输出后再发送结果。连接会立即建立，等待期间每 5 秒发送 SSE 心跳；上游返回空内容时会发送明确的错误。心跳不会显示为模型正文，实际工具调用仍需等待生成完成。
+
+服务端会先收集上游 SSE，再解析完整 JSON。上游最后一个 SSE 事件可能同时包含最后一段文本和 `finish_reason`；服务端会先处理最后一段内容，再结束本轮响应，避免工具 JSON 的末尾被截掉。
 
 兼容性补充：
 
 - 解析优先级为 **JSON 优先**；
 - 同时兼容 XML 标签形式的工具调用块：`<tool_call>{"name":"...","arguments":{...}}</tool_call>`；
-- 当模型输出多个 `<tool_call>...</tool_call>` 块时，会按顺序解析为多个 `tool_calls`。
+- 支持标准 `tool_calls` 对象、顶层调用数组、单个嵌套 `function` 对象和尾随文字；多个 `<tool_call>...</tool_call>` 块会按顺序解析。
+- 工具名称必须来自本次请求，参数必须是合法 JSON 对象。上游正常结束且每个调用及参数完整时，允许补齐缺少的外层数组或包装对象闭合；参数、字符串或调用对象残缺时仍明确报错。正文中的 `name` 字段和普通 JSON 数据不会仅因字段名被当作工具调用。
+- 普通文本响应保留上游 `length` 等结束原因。异常 EOF 不会作为正常完成；工具响应被长度限制中断时不会执行其调用。
+- 上游正常结束但没有正文或工具调用时，最多重新请求一次生成；两次均为空则明确报错。重试沿用原历史，不执行客户端工具。已有正文/调用、网络错误、长度限制或异常 EOF 不会触发此重试。
+- Chat Completions 工具请求也支持上游原生 `tool_calls` / `function_call` 增量，以及 `choice.message` 形式的完整结果，统一聚合后校验。`reasoning_content` 与 `reasoning` 均会识别；仅有思考而无最终输出时也受上述一次重试限制。
 
 ### 图片输入（仅 GPT 模型）
 
@@ -208,6 +233,34 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 ![图片说明](images/chrome.png)
 
 对于图片功能, 需要捕获`upload` API, 提取请求 header 中的 `token` ,然后通过 `--upload-token` 传入.
+
+## 常见问题
+
+### 工具调用结果被截断
+
+最近一次测试结果与验证范围见[工具调用测试记录](docs/工具调用测试.md)。
+
+对于 DSH 这类带较长系统提示和多个工具的客户端，兼容层会在完整上下文末尾附加工具输出格式约定。如果只收到“我先查看项目”之类的行动预告就结束，需区分模型未生成工具调用与 JSON 被截断；两者的排查方向不同。
+
+先确认客户端发送的是 `tools` 和 `tool_choice`，并检查服务端日志中的上游 HTTP 状态。带工具的流式请求会在服务端聚合上游内容，因此客户端收到第一个 `tool_calls` chunk 前可能会等待一段时间，期间会持续收到 SSE 心跳。
+
+如果仍然出现截断，可以用不带工具的请求确认普通流式链路，再用 `stream: false` 检查模型是否能返回完整 JSON。上游 token 失效时，服务端会收到 `Token失效，请重新登录`，这不是工具解析错误。
+
+### Token 无效
+
+可以直接传入新的 token：
+
+```bash
+uv run main.py --token '<token>'
+```
+
+也可以使用自动登录：
+
+```bash
+uv run main.py --account '<学号>@<密码>'
+```
+
+不要把真实 token 或密码写进仓库、Issue、日志和示例文档。
 
 ## 开发与贡献指南
 

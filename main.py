@@ -1,15 +1,12 @@
 import argparse
-import base64
 import hashlib
 import json
 import logging
-import mimetypes
 import os
-import re
 import sys
+import time
 import uuid
 from datetime import datetime
-from urllib.parse import urlparse
 
 import requests
 from flask import Flask, Response, jsonify, request, stream_with_context
@@ -19,6 +16,35 @@ from rich.logging import RichHandler
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "utility", "auto_login"))
 from cas_login import LoginError, login_genai
+from genai_proxy.models import (
+    MODEL_SPECS,
+    build_remote_model_list,
+    resolve_model,
+    is_gpt_model,
+)
+from genai_proxy.upstream import (
+    build_chat_completion_payload,
+    extract_delta_from_genai,
+    build_response_input_messages,
+    iter_sse_events,
+    ToolCallAccumulator,
+)
+from genai_proxy.streaming import iter_with_heartbeat
+from genai_proxy.images import (
+    guess_filename_from_url,
+    read_image_from_data_url,
+    fetch_image_bytes,
+    parse_image_input_from_message,
+)
+from genai_proxy.tools import (
+    convert_messages_to_genai_format,
+    normalize_messages_for_genai,
+    should_enable_tools,
+    get_request_tools,
+    get_request_tool_choice,
+    build_tool_calling_messages,
+    parse_tool_calls_from_content,
+)
 
 app = Flask(__name__)
 CORS(app)
@@ -183,6 +209,7 @@ GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
 GENAI_MODELS_URL = "https://genai.shanghaitech.edu.cn/htk/ai/aiModel/list"
 GENAI_UPLOAD_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/upload"
 GENAI_IMAGE_STATIC_URL = "https://genaipic.shanghaitech.edu.cn//sys/common/static/"
+GENAI_STREAM_TIMEOUT = (10, 180)
 GENAI_HEADERS = {
     "Accept": "*/*, text/event-stream",
     "Cache-Control": "no-cache",
@@ -199,139 +226,6 @@ GENAI_HEADERS = {
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
 }
-
-MODEL_SPECS = [
-    {
-        "public_id": "deepseek-r1",
-        "request_id": "deepseek-r1:671b",
-        "actual_id": "deepseek-r1:671b",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "deepseek-v3",
-        "request_id": "deepseek-v3:671b",
-        "actual_id": "deepseek-v3:671b",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "glm-5.1",
-        "request_id": "chatglm",
-        "actual_id": "glm-chat",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "minimax-m1",
-        "request_id": "MiniMax-M1",
-        "actual_id": "minimax",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "qwen3.5-397b-a17b",
-        "request_id": "qwen-instruct",
-        "actual_id": "qwen-instruct",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "gpt-5.5",
-        "request_id": "GPT-5.5",
-        "actual_id": "gpt-5.5-2026-04-24",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-5.4",
-        "request_id": "GPT-5.4",
-        "actual_id": "gpt-5.4-2026-03-05",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-5.2",
-        "request_id": "GPT-5.2",
-        "actual_id": "gpt-5.2-2025-12-11",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-5",
-        "request_id": "GPT-5",
-        "actual_id": "gpt-5-2025-08-07",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-4.1",
-        "request_id": "GPT-4.1",
-        "actual_id": "gpt-4.1-2025-04-14",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-4.1-mini",
-        "request_id": "GPT-4.1-mini",
-        "actual_id": "gpt-4.1-mini-2025-04-14",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-o4-mini",
-        "request_id": "o4-mini",
-        "actual_id": "o4-mini-2025-04-16",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-o3",
-        "request_id": "o3",
-        "actual_id": "o3-2025-04-16",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "deepseek-pro",
-        "request_id": "deepseek-pro",
-        "actual_id": "deepseek-v4-pro",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "deepseek-chat",
-        "request_id": "deepseek-chat",
-        "actual_id": "deepseek-v4-flash",
-        "root_ai_type": "xinference",
-    },
-]
-
-
-def build_model_alias_lookup():
-    """构建模型别名查找表。
-
-    将对外公开名称、上游请求名称和上游实际模型名称统一映射到同一份
-    模型规格上，便于后续按任意别名解析。
-
-    Returns:
-        dict[str, dict]: 以小写别名为键、模型规格字典为值的查找表。
-    """
-    alias_lookup = {}
-    for spec in MODEL_SPECS:
-        for alias in {spec["public_id"], spec["request_id"], spec["actual_id"]}:
-            alias_lookup[alias.lower()] = spec
-    return alias_lookup
-
-
-MODEL_ALIAS_LOOKUP = build_model_alias_lookup()
-
-
-def resolve_model(model_name):
-    """解析模型名称到上游请求参数。
-
-    Args:
-        model_name (Any): 调用方传入的模型名，可能是 public id、request id
-            或 actual id。
-
-    Returns:
-        tuple[Any, str]: 第一个元素为实际发给上游的 `aiType`，第二个元素为
-        `rootAiType`。
-    """
-    if not isinstance(model_name, str):
-        return model_name, infer_root_ai_type(model_name)
-
-    spec = MODEL_ALIAS_LOOKUP.get(model_name.lower())
-    if spec is None:
-        return model_name, infer_root_ai_type(model_name)
-    return spec["request_id"], spec["root_ai_type"]
-
 
 def get_request_access_token():
     """从 OpenAI 常用认证头中提取请求级 GenAI token。"""
@@ -379,7 +273,10 @@ def fetch_remote_models(access_token=None):
     payload = response.json()
     if not payload.get("success"):
         raise RuntimeError(f"Failed to fetch remote models: {payload}")
-    return payload.get("result", {}).get("records", [])
+    records = (payload.get("result") or {}).get("records")
+    if not isinstance(records, list):
+        raise RuntimeError("Invalid remote model list: missing records array")
+    return records
 
 
 def log_new_remote_models(access_token=None):
@@ -446,64 +343,6 @@ def build_genai_upload_headers(access_token=None):
     return headers
 
 
-def infer_root_ai_type(model_name):
-    """为未知模型推断上游路由类型。
-
-    Args:
-        model_name (Any): 调用方传入的模型名。
-
-    Returns:
-        str: 推断得到的 `rootAiType`，当前仅返回 `azure` 或 `xinference`。
-    """
-    if not isinstance(model_name, str):
-        return "xinference"
-
-    normalized = model_name.lower()
-    # OpenAI / Azure 系列模型目前统一走 azure 路由。
-    azure_markers = (
-        "gpt-",
-        "gpt",
-        "o3",
-        "o4-mini",
-    )
-    return "azure" if normalized.startswith(azure_markers) else "xinference"
-
-
-def is_gpt_model(model_name):
-    """判断模型是否为 GPT/Azure 系列（图片能力仅对其开放）。"""
-    _, root_ai_type = resolve_model(model_name)
-    return root_ai_type == "azure"
-
-
-def guess_filename_from_url(image_url):
-    """从 URL 推断文件名。"""
-    path = urlparse(image_url).path
-    filename = os.path.basename(path) or "image"
-    if "." not in filename:
-        filename += ".jpg"
-    return filename
-
-
-def read_image_from_data_url(data_url):
-    """解析 data URL，返回 (bytes, mime_type, filename)。"""
-    header, encoded = data_url.split(",", 1)
-    mime_type = "image/jpeg"
-    if header.startswith("data:"):
-        mime_type = header[5:].split(";")[0] or mime_type
-    extension = mimetypes.guess_extension(mime_type) or ".jpg"
-    image_bytes = base64.b64decode(encoded)
-    return image_bytes, mime_type, f"image{extension}"
-
-
-def fetch_image_bytes(image_url):
-    """下载远端图片，返回 (bytes, mime_type, filename)。"""
-    response = requests.get(image_url, timeout=60)
-    response.raise_for_status()
-    mime_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0].strip() or "image/jpeg"
-    filename = guess_filename_from_url(image_url)
-    return response.content, mime_type, filename
-
-
 def upload_image_to_genai(image_bytes, filename, mime_type, access_token=None):
     """上传图片到 GenAI 图片服务，返回上游需要的 URL 与尺寸信息。"""
     image_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -552,34 +391,6 @@ def upload_image_to_genai(image_bytes, filename, mime_type, access_token=None):
     return payload
 
 
-def parse_image_input_from_message(message):
-    """从单条 OpenAI user message 中提取图片输入（URL 或 data URL）。"""
-    if not isinstance(message, dict) or message.get("role") != "user":
-        return None
-
-    content = message.get("content")
-    if not isinstance(content, list):
-        return None
-
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        part_type = part.get("type")
-        if part_type not in {"image_url", "input_image"}:
-            continue
-
-        if isinstance(part.get("image_url"), dict):
-            url_value = part["image_url"].get("url")
-            if url_value:
-                return url_value
-        if isinstance(part.get("image_url"), str):
-            return part.get("image_url")
-        if isinstance(part.get("url"), str):
-            return part.get("url")
-
-    return None
-
-
 def prepare_image_payload(messages, model, access_token=None):
     """从请求消息中准备上游所需图片参数（仅 GPT 模型可用）。"""
     image_input = None
@@ -606,345 +417,7 @@ def prepare_image_payload(messages, model, access_token=None):
     return image_payload
 
 
-def convert_messages_to_genai_format(messages):
-    """从消息列表中提取 GenAI 所需的 `chatInfo`。
-
-    当前上游实际请求中 `chatInfo` 只使用最后一条用户消息内容，因此这里
-    仅做最小提取。
-
-    Args:
-        messages (list[dict]): OpenAI 风格的消息列表。
-
-    Returns:
-        str: 最后一条用户消息的文本内容；若不存在则返回空字符串。
-    """
-    # 上游会单独接收一份 chatInfo，这里取最后一条 user 消息与网页行为对齐。
-    chat_info = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            chat_info = msg.get("content", "")
-            break
-    
-    return chat_info
-
-
-def normalize_content_for_genai(content):
-    """将 OpenAI 消息 content 归一化为上游可读文本。"""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, dict):
-                text = part.get("text")
-                if text:
-                    text_parts.append(text)
-            elif isinstance(part, str):
-                text_parts.append(part)
-        return "\n".join(text_parts)
-    return str(content)
-
-
-def normalize_messages_for_genai(messages):
-    """把 OpenAI tool messages 降级为普通文本，避免上游无法理解原生工具结构。"""
-    normalized_messages = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-
-        role = message.get("role", "user")
-        content = normalize_content_for_genai(message.get("content"))
-
-        if role == "tool":
-            tool_name = message.get("name") or message.get("tool_call_id") or "tool"
-            normalized_messages.append({
-                "role": "user",
-                "content": f"工具 {tool_name} 返回结果：\n{content}",
-            })
-            continue
-
-        tool_calls = message.get("tool_calls")
-        if role == "assistant" and tool_calls and not content:
-            normalized_messages.append({
-                "role": "assistant",
-                "content": "已请求调用工具：\n" + json.dumps(tool_calls, ensure_ascii=False),
-            })
-            continue
-
-        normalized_messages.append({
-            "role": role,
-            "content": content,
-        })
-
-    return normalized_messages
-
-
-def should_enable_tools(tools, tool_choice):
-    """判断当前请求是否需要启用本地工具调用兼容层。"""
-    return bool(tools) and tool_choice != "none"
-
-
-def get_request_tools(req_data):
-    """读取新版 tools 或旧版 functions 入参，统一为 OpenAI tools 结构。"""
-    tools = req_data.get("tools")
-    if tools:
-        return tools
-
-    functions = req_data.get("functions")
-    if not functions:
-        return []
-
-    return [
-        {
-            "type": "function",
-            "function": function,
-        }
-        for function in functions
-        if isinstance(function, dict)
-    ]
-
-
-def get_request_tool_choice(req_data):
-    """读取新版 tool_choice 或旧版 function_call 入参。"""
-    if "tool_choice" in req_data:
-        return req_data.get("tool_choice")
-
-    function_call = req_data.get("function_call")
-    if isinstance(function_call, dict) and function_call.get("name"):
-        return {"name": function_call["name"]}
-    return function_call
-
-
-def normalize_tool_choice(tool_choice):
-    """将 OpenAI 的 tool_choice 归一化为提示词中便于描述的约束。"""
-    if tool_choice is None:
-        return "auto"
-    if isinstance(tool_choice, str):
-        return tool_choice
-    if isinstance(tool_choice, dict):
-        if tool_choice.get("name"):
-            return {"name": tool_choice["name"]}
-        function_name = tool_choice.get("function", {}).get("name")
-        if function_name:
-            return {"name": function_name}
-    return "auto"
-
-
-def build_tool_calling_messages(messages, tools, tool_choice):
-    """通过提示词工程让无原生工具调用能力的上游返回可解析的工具调用 JSON。"""
-    normalized_choice = normalize_tool_choice(tool_choice)
-    tool_prompt = [
-        "你可以调用调用方提供的工具，但上游 API 没有原生 tool calling 能力。",
-        "当你决定调用工具时，优先输出一个 JSON 对象，不要输出 Markdown、解释或额外文本。",
-        "JSON 格式必须为：{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{}}]}。",
-        "兼容格式：也允许输出 <tool_call>{\"name\":\"工具名\",\"arguments\":{}}</tool_call>；若并行调用可连续输出多个 <tool_call>...</tool_call>。",
-        "arguments 必须是符合工具 JSON Schema 的对象。",
-        "如果不需要调用工具，则正常回答用户，不要输出上述 JSON。",
-        f"tool_choice: {json.dumps(normalized_choice, ensure_ascii=False)}",
-        "可用工具：",
-        json.dumps(tools, ensure_ascii=False),
-    ]
-
-    if normalized_choice == "required":
-        tool_prompt.append("本次请求必须调用至少一个工具。")
-    elif isinstance(normalized_choice, dict):
-        tool_prompt.append(f"本次请求必须调用工具 {normalized_choice['name']}。")
-
-    return [
-        {"role": "system", "content": "\n".join(tool_prompt)},
-        *messages,
-    ]
-
-
-def strip_json_code_fence(text):
-    """去掉模型偶尔包裹的 JSON Markdown 代码块。"""
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-
-    lines = stripped.splitlines()
-    if len(lines) >= 2 and lines[-1].strip() == "```":
-        return "\n".join(lines[1:-1]).strip()
-    return stripped
-
-
-def extract_json_object(text):
-    """从文本中提取第一个完整 JSON 对象。"""
-    stripped = strip_json_code_fence(text)
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-
-    start = stripped.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(stripped)):
-        char = stripped[index]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(stripped[start:index + 1])
-                except json.JSONDecodeError:
-                    return None
-    return None
-
-
-def normalize_tool_call_arguments(arguments):
-    """OpenAI 要求 function.arguments 是 JSON 字符串。"""
-    if isinstance(arguments, str):
-        return arguments
-    if arguments is None:
-        return "{}"
-    return json.dumps(arguments, ensure_ascii=False)
-
-
-def extract_tool_calls_from_xml(content):
-    """从 <tool_call>...</tool_call> 中提取工具调用（XML 兼容，JSON 仍为主）。"""
-    if not content:
-        return []
-
-    blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.DOTALL)
-    tool_calls = []
-    for block in blocks:
-        parsed = extract_json_object(block)
-        if not isinstance(parsed, dict):
-            continue
-
-        name = parsed.get("name")
-        if not name:
-            continue
-
-        arguments = parsed.get("arguments", {})
-        tool_calls.append({
-            "id": f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": normalize_tool_call_arguments(arguments),
-            },
-        })
-
-    return tool_calls
-
-
-def parse_tool_calls_from_content(content):
-    """解析提示词约定的工具调用 JSON，并转换为 OpenAI tool_calls 结构。"""
-    if not content:
-        return []
-
-    # 优先 JSON：兼容当前主路径。
-    parsed = extract_json_object(content)
-    raw_calls = None
-    if isinstance(parsed, dict):
-        raw_calls = parsed.get("tool_calls")
-        if raw_calls is None and parsed.get("name"):
-            raw_calls = [parsed]
-    elif "<tool_call>" in content:
-        # JSON 解析失败时回退 XML。
-        return extract_tool_calls_from_xml(content)
-
-    if not isinstance(raw_calls, list):
-        if "<tool_call>" in content:
-            return extract_tool_calls_from_xml(content)
-        return []
-
-    tool_calls = []
-    for raw_call in raw_calls:
-        if not isinstance(raw_call, dict):
-            continue
-
-        function = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else raw_call
-        name = function.get("name")
-        if not name:
-            continue
-
-        arguments = function.get("arguments", {})
-        tool_calls.append({
-            "id": raw_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": normalize_tool_call_arguments(arguments),
-            },
-        })
-
-    return tool_calls
-
-
-def build_chat_completion_payload(model, content, reasoning_content=None, tool_calls=None):
-    """构建非流式 Chat Completions 响应。"""
-    message = {
-        "role": "assistant",
-        "content": None if tool_calls else content,
-    }
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-    elif reasoning_content is not None:
-        message["reasoning_content"] = reasoning_content
-
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-        "object": "chat.completion",
-        "created": int(datetime.now().timestamp()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": "tool_calls" if tool_calls else "stop"
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": len(content or ""),
-            "total_tokens": len(content or "")
-        }
-    }
-
-def extract_delta_from_genai(response_data):
-    """从 GenAI 增量响应中提取正文和思维链字段。
-
-    Args:
-        response_data (dict): 单条 GenAI SSE 数据解析后的 JSON 对象。
-
-    Returns:
-        dict[str, str | None]: 包含 `reasoning` 与 `content` 两个字段；若缺失则
-        返回 `None`。
-    """
-    try:
-        if "choices" in response_data and len(response_data["choices"]) > 0:
-            delta = response_data["choices"][0].get("delta", {})
-            return {
-                "reasoning": delta.get("reasoning"),
-                "content": delta.get("content"),
-            }
-    except (KeyError, IndexError, TypeError):
-        pass
-    return {"reasoning": None, "content": None}
-
-
-def stream_genai_events(messages, model, max_tokens, access_token=None, image_payload=None):
+def _stream_genai_attempt(messages, model, max_tokens, access_token=None, image_payload=None, request_id=None, attempt=1):
     """调用 GenAI 流式接口并产出统一事件流。
 
     该函数是整个协议转换的底层入口，负责：
@@ -988,13 +461,34 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
         len(messages) if isinstance(messages, list) else 0,
     )
 
+    response = None
+    started_at = time.monotonic()
+    stats = {"events": 0, "content_chars": 0, "reasoning_chars": 0,
+             "native_fragments": 0, "delta_fields": {}, "message_fields": {}, "finish_reason": None}
+
+    def trace_delta(payload):
+        stats["events"] += 1
+        choice = (payload.get("choices") or [{}])[0]
+        for source, key in (("delta", "delta_fields"), ("message", "message_fields")):
+            fields = choice.get(source)
+            if isinstance(fields, dict):
+                for name in fields:
+                    stats[key][name] = stats[key].get(name, 0) + 1
+        stats["finish_reason"] = choice.get("finish_reason") or stats["finish_reason"]
+        delta = extract_delta_from_genai(payload)
+        for field, key in (("content", "content_chars"), ("reasoning", "reasoning_chars")):
+            if isinstance(delta.get(field), str):
+                stats[key] += len(delta[field])
+        stats["native_fragments"] += len(delta.get("tool_calls") or [])
+        return delta
+
     try:
         response = requests.post(
             GENAI_URL,
             headers=build_genai_headers(access_token),
             json=genai_data,
             stream=True,
-            timeout=60
+            timeout=GENAI_STREAM_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -1005,62 +499,13 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
             }
             return
 
-        finished = False
-        for line in response.iter_lines():
-            if finished:
-                break
-
-            if line:
-                try:
-                    line_str = line.decode('utf-8') if isinstance(line, bytes) else line
-
-                    # 兼容标准 SSE 的 `data:` 前缀。
-                    if line_str.startswith('data:'):
-                        line_str = line_str[5:].strip()
-
-                    if line_str:
-                        genai_json = json.loads(line_str)
-                        logger.debug("Upstream SSE chunk keys: %s", list(genai_json.keys()))
-
-                        # 上游偶尔会返回补充元数据，先保留为内部 meta 事件。
-                        if genai_json.get("other"):
-                            yield {
-                                "type": "meta",
-                                "other": genai_json.get("other"),
-                            }
-
-                        # 只要上游给出 finish_reason，就视为本轮流式输出结束。
-                        if "choices" in genai_json and len(genai_json["choices"]) > 0:
-                            choice = genai_json["choices"][0]
-                            if choice.get("finish_reason") is not None:
-                                finished = True
-
-                        if finished:
-                            yield {
-                                "type": "done",
-                                "upstream_model": genai_json.get("model"),
-                            }
-                            break
-
-                        delta = extract_delta_from_genai(genai_json)
-                        reasoning = delta.get("reasoning")
-                        content = delta.get("content")
-                        # 内部统一拆成 reasoning 和 content，便于上层复用。
-                        if reasoning is not None or content is not None:
-                            yield {
-                                "type": "delta",
-                                "upstream_model": genai_json.get("model"),
-                                "reasoning": reasoning,
-                                "content": content,
-                            }
-
-                except json.JSONDecodeError:
-                    pass
-
-        yield {
-            "type": "done",
-            "upstream_model": None,
-        }
+        for event in iter_sse_events(response.iter_lines(chunk_size=1), trace_delta):
+            if event["type"] == "delta":
+                logger.debug("Upstream SSE delta received")
+            if event["type"] == "done":
+                stats["completion_marker"] = True
+                stats["finish_reason"] = event.get("finish_reason")
+            yield event
 
     except Exception as e:
         logger.exception("stream_genai_events failed")
@@ -1069,6 +514,60 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
             "type": "error",
             "error": str(e),
         }
+    finally:
+        if response is not None:
+            response.close()
+        logger.info(
+            "Upstream summary: request_id=%s attempt=%s model=%s elapsed=%.2fs stats=%s",
+            request_id, attempt, model, time.monotonic() - started_at, json.dumps(stats),
+        )
+
+
+def stream_genai_events(messages, model, max_tokens, access_token=None, image_payload=None):
+    """仅对正常结束的空生成重试一次；发布正文或调用后不再重试。"""
+    request_id = uuid.uuid4().hex[:12]
+    for attempt in (1, 2):
+        pending = []
+        published = False
+        retry = False
+        events = _stream_genai_attempt(
+            messages, model, max_tokens, access_token, image_payload, request_id, attempt,
+        )
+        try:
+            for event in events:
+                if event["type"] == "error":
+                    yield event
+                    return
+                if event["type"] == "delta":
+                    has_output = bool((event.get("content") or "").strip() or event.get("tool_calls"))
+                    if not published and not has_output:
+                        pending.append(event)
+                        continue
+                    if not published:
+                        yield from pending
+                        pending.clear()
+                        published = True
+                    yield event
+                elif event["type"] == "done":
+                    if not published and event.get("finish_reason", "stop") == "stop":
+                        if attempt == 1:
+                            logger.warning("Retrying empty upstream generation: request_id=%s", request_id)
+                            retry = True
+                            break
+                        yield {"type": "error", "error": "GenAI upstream returned an empty response after one retry"}
+                        return
+                    yield from pending
+                    yield event
+                    return
+                else:
+                    yield event
+        finally:
+            close = getattr(events, "close", None)
+            if close:
+                close()
+        if not retry:
+            yield {"type": "error", "error": "GenAI upstream stream ended without a completion marker"}
+            return
 
 
 def stream_chat_completions_response(messages, model, max_tokens, access_token=None, image_payload=None):
@@ -1087,8 +586,11 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
     created = int(datetime.now().timestamp())
 
     for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
+        if event["type"] == "delta" and event.get("tool_calls"):
+            event = {"type": "error", "error": "Upstream returned native tool calls without enabled tools"}
         if event["type"] == "error":
             yield f"data: {json.dumps({'error': event['error']})}\n\n"
+            yield "data: [DONE]\n\n"
             return
 
         if event["type"] == "delta":
@@ -1125,7 +627,7 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
                     {
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop"
+                        "finish_reason": event.get("finish_reason", "stop")
                     }
                 ]
             }
@@ -1134,7 +636,7 @@ def stream_chat_completions_response(messages, model, max_tokens, access_token=N
             return
 
 
-def stream_tool_calls_response(model, content, tool_calls):
+def stream_tool_calls_response(model, content, tool_calls, finish_reason="stop"):
     """将完整解析出的工具调用转换为 Chat Completions SSE。"""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
@@ -1183,7 +685,6 @@ def stream_tool_calls_response(model, content, tool_calls):
             ]
         }
         yield f"data: {json.dumps(content_chunk)}\n\n"
-        finish_reason = "stop"
 
     final_response = {
         "id": response_id,
@@ -1200,6 +701,55 @@ def stream_tool_calls_response(model, content, tool_calls):
     }
     yield f"data: {json.dumps(final_response)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def stream_buffered_tool_response(messages, model, max_tokens, access_token=None, image_payload=None, tools=None, tool_choice=None):
+    """聚合工具 JSON 时发送心跳，避免客户端在静默等待时断开。"""
+    started_at = time.monotonic()
+    content_parts = []
+    native_calls = ToolCallAccumulator()
+    finish_reason = None
+    events = iter_with_heartbeat(
+        stream_genai_events(messages, model, max_tokens, access_token, image_payload)
+    )
+    try:
+        for event in events:
+            if event is None:
+                yield ": keep-alive\n\n"
+            elif event["type"] == "error":
+                raise RuntimeError(event["error"])
+            elif event["type"] == "delta":
+                if event.get("content"):
+                    content_parts.append(event["content"])
+                native_calls.add(event.get("tool_calls"))
+            elif event["type"] == "done":
+                finish_reason = event.get("finish_reason", "stop")
+                break
+        content = "".join(content_parts)
+        raw_calls = native_calls.result()
+        if not content.strip() and not raw_calls:
+            raise RuntimeError("GenAI upstream returned an empty response; please retry")
+        if finish_reason not in ("stop", "tool_calls", "function_call"):
+            raise RuntimeError(f"GenAI tool response was not completed: {finish_reason}")
+        tool_calls = parse_tool_calls_from_content(
+            json.dumps({"tool_calls": raw_calls}) if raw_calls else content, tools, tool_choice,
+        )
+        if finish_reason in ("tool_calls", "function_call") and not tool_calls:
+            raise RuntimeError("GenAI upstream ended with tool_calls but returned no valid call")
+        logger.info(
+            "Tool response collected: model=%s elapsed=%.1fs content_chars=%s tool_call_count=%s",
+            model, time.monotonic() - started_at, len(content), len(tool_calls),
+        )
+        yield from stream_tool_calls_response(model, content, tool_calls)
+    except Exception as exc:
+        logger.warning(
+            "Tool stream failed: model=%s content_chars=%s finish_reason=%s error=%s",
+            model, sum(map(len, content_parts)), finish_reason, exc,
+        )
+        yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}})}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        events.close()
 
 
 def collect_genai_response(messages, model, max_tokens, access_token=None, image_payload=None):
@@ -1219,71 +769,31 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
     """
     content_parts = []
     reasoning_parts = []
+    native_calls = ToolCallAccumulator()
     upstream_model = None
+    finish_reason = "stop"
 
     for event in stream_genai_events(messages, model, max_tokens, access_token, image_payload):
         if event["type"] == "error":
             raise RuntimeError(event["error"])
         if event["type"] == "delta":
+            native_calls.add(event.get("tool_calls"))
             upstream_model = event.get("upstream_model") or upstream_model
             if event.get("reasoning"):
                 reasoning_parts.append(event["reasoning"])
             if event.get("content"):
                 content_parts.append(event["content"])
         if event["type"] == "done":
+            finish_reason = event.get("finish_reason", "stop")
             break
 
     return {
         "content": "".join(content_parts),
         "reasoning_content": "".join(reasoning_parts),
         "upstream_model": upstream_model,
+        "finish_reason": finish_reason,
+        "tool_calls": native_calls.result(),
     }
-
-
-def build_response_input_messages(input_value):
-    """将 Responses API 输入归一化为消息列表。
-
-    当前仅处理文本输入，兼容字符串输入以及包含文本片段的数组输入。
-
-    Args:
-        input_value (str | list | Any): `/v1/responses` 的 `input` 字段。
-
-    Returns:
-        list[dict]: 可直接发给上游的消息列表。
-    """
-    if isinstance(input_value, str):
-        return [{"role": "user", "content": input_value}]
-
-    if isinstance(input_value, list):
-        messages = []
-        for item in input_value:
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("role", "user")
-            content = item.get("content")
-
-            if isinstance(content, str):
-                messages.append({"role": role, "content": content})
-                continue
-
-            if isinstance(content, list):
-                # 仅提取文本片段，忽略当前版本尚未支持的其他 item 类型。
-                text_parts = []
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    part_type = part.get("type")
-                    if part_type in {"input_text", "text", "output_text"}:
-                        text = part.get("text")
-                        if text:
-                            text_parts.append(text)
-                if text_parts:
-                    messages.append({"role": role, "content": "\n".join(text_parts)})
-
-        return messages
-
-    return []
 
 
 def stream_responses_api(messages, model, max_tokens, access_token=None):
@@ -1316,6 +826,8 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
     yield f"data: {json.dumps(created_event)}\n\n"
 
     for event in stream_genai_events(messages, model, max_tokens, access_token):
+        if event["type"] == "delta" and event.get("tool_calls"):
+            event = {"type": "error", "error": "Native tool calls require Chat Completions with enabled tools"}
         if event["type"] == "error":
             error_event = {
                 "type": "response.failed",
@@ -1356,14 +868,16 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
                 yield f"data: {json.dumps(content_event)}\n\n"
 
         if event["type"] == "done":
+            incomplete = event.get("finish_reason", "stop") != "stop"
             completed_event = {
-                "type": "response.completed",
+                "type": "response.incomplete" if incomplete else "response.completed",
                 "response": {
                     "id": response_id,
                     "object": "response",
                     "created_at": created,
-                    "status": "completed",
+                    "status": "incomplete" if incomplete else "completed",
                     "model": model,
+                    "incomplete_details": {"reason": event["finish_reason"]} if incomplete else None,
                 }
             }
             yield f"data: {json.dumps(completed_event)}\n\n"
@@ -1407,15 +921,20 @@ def chat_completions():
 
         if stream:
             if tools_enabled:
-                collected = collect_genai_response(upstream_messages, model, max_tokens, access_token, image_payload)
-                tool_calls = parse_tool_calls_from_content(collected["content"])
+                logger.info(
+                    "Collecting tool response: model=%s message_count=%s tool_count=%s",
+                    model,
+                    len(upstream_messages),
+                    len(tools),
+                )
                 return Response(
-                    stream_with_context(stream_tool_calls_response(model, collected["content"], tool_calls)),
+                    stream_with_context(stream_buffered_tool_response(upstream_messages, model, max_tokens, access_token, image_payload, tools, tool_choice)),
                     mimetype='text/event-stream',
                     headers={
                         'Cache-Control': 'no-cache',
                         'Connection': 'keep-alive',
                         'Content-Type': 'text/event-stream',
+                        'X-Accel-Buffering': 'no',
                     }
                 )
 
@@ -1431,12 +950,20 @@ def chat_completions():
 
         # 非流式模式先完整收集，再一次性组装 OpenAI 响应体。
         collected = collect_genai_response(upstream_messages, model, max_tokens, access_token, image_payload)
-        tool_calls = parse_tool_calls_from_content(collected["content"]) if tools_enabled else []
+        if collected["tool_calls"] and not tools_enabled:
+            raise RuntimeError("Upstream returned native tool calls without enabled tools")
+        if tools_enabled and collected["finish_reason"] not in ("stop", "tool_calls", "function_call"):
+            raise RuntimeError(f"GenAI tool response was not completed: {collected['finish_reason']}")
+        tool_content = json.dumps({"tool_calls": collected["tool_calls"]}) if collected["tool_calls"] else collected["content"]
+        tool_calls = parse_tool_calls_from_content(tool_content, tools, tool_choice) if tools_enabled else []
+        if tools_enabled and collected["finish_reason"] in ("tool_calls", "function_call") and not tool_calls:
+            raise RuntimeError("GenAI upstream ended with tool_calls but returned no valid call")
         response = build_chat_completion_payload(
             model,
             collected["content"],
             collected["reasoning_content"],
             tool_calls,
+            collected["finish_reason"],
         )
         return jsonify(response)
     
@@ -1480,6 +1007,9 @@ def responses():
 
         # 非流式返回时，将 reasoning 和 message 组装到 output 数组中。
         collected = collect_genai_response(messages, model, max_output_tokens, access_token)
+        if collected["tool_calls"]:
+            raise RuntimeError("Native tool calls require Chat Completions with enabled tools")
+        incomplete = collected["finish_reason"] != "stop"
         response_id = f"resp_{uuid.uuid4().hex}"
         output = []
         if collected["reasoning_content"]:
@@ -1509,7 +1039,8 @@ def responses():
             "id": response_id,
             "object": "response",
             "created_at": int(datetime.now().timestamp()),
-            "status": "completed",
+            "status": "incomplete" if incomplete else "completed",
+            "incomplete_details": {"reason": collected["finish_reason"]} if incomplete else None,
             "model": model,
             "output": output,
             "output_text": collected["content"],
@@ -1521,21 +1052,17 @@ def responses():
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
-    """返回当前对外暴露的模型列表。
+    """使用当前请求凭据拉取上游模型列表。
 
     Returns:
         Response: OpenAI `/v1/models` 兼容 JSON 响应。
     """
-    models = []
-    for spec in MODEL_SPECS:
-        models.append({
-            "id": spec["public_id"],
-            "object": "model",
-            "owned_by": "genai",
-            "permission": []
-        })
-    
-    return jsonify({"object": "list", "data": models})
+    try:
+        records = fetch_remote_models(get_request_access_token())
+        return jsonify(build_remote_model_list(records))
+    except Exception as exc:
+        logger.exception("Failed to fetch remote model list")
+        return jsonify({"error": str(exc)}), 502
 
 @app.route('/health', methods=['GET'])
 def health_check():
